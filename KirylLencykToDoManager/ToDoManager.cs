@@ -1,9 +1,11 @@
 ﻿using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.IO;
 using System.Linq;
-using System.Security.Cryptography.X509Certificates;
 using System.Text;
 using System.Threading.Tasks;
+using System.Xml.Serialization;
 using KirylLencykToDoManager.ToDoManagerServiceReference;
 using ToDo.Infrastructure;
 
@@ -15,17 +17,27 @@ namespace KirylLencykToDoManager
 
         private readonly ToDoManagerServiceReference.ToDoManagerClient toDoManagerClient;
 
-        private List<IToDoItem> localItems; 
+        private static readonly string queueXml = "queue.xml";
+
+        private List<IToDoItem> localItems;
+
+        private ConcurrentDictionary<ToDoItemWorkItem, int> workQueue;
+
+        private object synck;
 
         public ToDoManager()
         {
             toDoManagerClient = new ToDoManagerServiceReference.ToDoManagerClient();
+            workQueue = new ConcurrentDictionary<ToDoItemWorkItem, int>();
+            synck = new object();
+            LoadWorkQueue();
+            InvokeWorkQueue();
         }
 
 
         public List<IToDoItem> GetTodoList(int userId)
         {
-            if(currentUserId != userId) LoadLocalStorage(userId);
+            if (currentUserId != userId) LoadLocalStorage(userId);
 
             return localItems;
 
@@ -40,7 +52,8 @@ namespace KirylLencykToDoManager
             {
                 int indexToUpdate = localItems.IndexOf(toUpdate);
                 localItems[indexToUpdate] = todo;
-                Task.Run(() => UpdateItemAsync(todo));
+                Task.Run(() => UpdateItem(todo));
+                Task.Run(() => InvokeWorkQueue());
             }
         }
 
@@ -50,10 +63,11 @@ namespace KirylLencykToDoManager
 
             todo.ToDoId = localItems.Count;
             localItems.Add(todo);
-            Task.Run(() => AddItemAsync(todo));
+            Task.Run(() => AddItem(todo));
+            Task.Run(() => InvokeWorkQueue());
         }
 
-       
+
 
         public void DeleteToDoItem(int todoItemId)
         {
@@ -61,12 +75,14 @@ namespace KirylLencykToDoManager
             if (toDelete != null)
             {
                 localItems.Remove(toDelete);
-                Task.Run(() => DeleteItemAsync(toDelete));
+                Task.Run(() => DeleteItem(toDelete));
+                Task.Run(() => InvokeWorkQueue());
             }
         }
 
         public int CreateUser(string name)
         {
+            InvokeWorkQueue();
             currentUserId = toDoManagerClient.CreateUser(name);
             LoadLocalStorage(currentUserId);
             return currentUserId;
@@ -78,31 +94,44 @@ namespace KirylLencykToDoManager
             currentUserId = userId;
         }
 
-        private  void AddItemAsync(IToDoItem todo)
+        private void AddItem(IToDoItem todo)
         {
+            var currentWorkItem = new ToDoItemWorkItem {Item = todo.ToRemoteToDoItem(), WorkType = ToDoWorkType.Add};
+            workQueue.TryAdd(currentWorkItem,1);
+            SaveWorkQueue();
             try
             {
-                toDoManagerClient.CreateToDoItem(todo.ToRemoteToDoItem());               
+                toDoManagerClient.CreateToDoItem(todo.ToRemoteToDoItem());
+                int i;
+                workQueue.TryRemove(currentWorkItem, out i);
+                SaveWorkQueue();
             }
             catch (Exception)
             {
-                
-                throw;
+                ;
             }
         }
 
-        private void DeleteItemAsync(IToDoItem todo)
+
+
+        private void DeleteItem(IToDoItem todo)
         {
+            var currentWorkItem = new ToDoItemWorkItem { Item = todo.ToRemoteToDoItem(), WorkType = ToDoWorkType.Add };
+            workQueue.TryAdd(currentWorkItem, 1);
+            SaveWorkQueue();
             try
             {
                 ToDoItem realItemToDelete = GetRealItem(todo);
-                if(realItemToDelete != null) 
+                if (realItemToDelete != null)
                     toDoManagerClient.DeleteToDoItem(realItemToDelete.ToDoId);
+
+                int i;
+                workQueue.TryRemove(currentWorkItem, out i);
+                SaveWorkQueue();
             }
             catch (Exception)
             {
-
-                throw;
+                ;
             }
         }
 
@@ -114,21 +143,106 @@ namespace KirylLencykToDoManager
             return realItem;
         }
 
-        private void UpdateItemAsync(IToDoItem todo)
+        private void UpdateItem(IToDoItem todo)
         {
+            var currentWorkItem = new ToDoItemWorkItem { Item = todo.ToRemoteToDoItem(), WorkType = ToDoWorkType.Add };
+            workQueue.TryAdd(currentWorkItem, 1);
+            SaveWorkQueue();
             try
             {
                 ToDoItem realItemToUpdate = GetRealItem(todo);
                 if (realItemToUpdate != null)
                     toDoManagerClient.UpdateToDoItem(realItemToUpdate);
+                int i;
+                workQueue.TryRemove(currentWorkItem, out i);
+                SaveWorkQueue();
             }
             catch (Exception)
             {
-
-                throw;
+                ;
             }
         }
 
+        private void InvokeToDoWorkItem(ToDoItemWorkItem item)
+        {
+            switch (item.WorkType)
+            {
+                case ToDoWorkType.Add:
+                    AddItem(item.Item);
+                    break;
+                case ToDoWorkType.Remove:
+                    DeleteItem(item.Item);
+                    break;
+                case ToDoWorkType.Update:
+                    UpdateItem(item.Item);
+                    break;
+            }
+        }
+
+        private void SaveWorkQueue()
+        {
+            lock (synck)
+            {
+
+                if (workQueue.Count != 0)
+                {
+                    using (var fs = new FileStream(queueXml, FileMode.Create))
+                    {
+                        var serializer = new XmlSerializer(typeof(List<ToDoItemWorkItem>));
+                        serializer.Serialize(fs, workQueue.Keys.ToList());
+                    }
+                }
+                else
+                {
+                    if (File.Exists(queueXml))
+                    {
+                        File.Delete(queueXml);
+                    }
+                }
+            }
+        }
+
+        private void InvokeWorkQueue()
+        {
+            ConcurrentDictionary<ToDoItemWorkItem, int> localQueueCopy;
+            lock (synck)
+            {
+                localQueueCopy = workQueue;
+                workQueue = new ConcurrentDictionary<ToDoItemWorkItem, int>();
+            }
+            foreach (ToDoItemWorkItem workItem in localQueueCopy.Keys)
+            {
+                InvokeToDoWorkItem(workItem);
+            }
+            if (workQueue.IsEmpty)
+            {
+                File.Delete(queueXml);
+            }
+        }
+
+        private void LoadWorkQueue()
+        {
+            lock (synck)
+            {
+
+                if (File.Exists(queueXml))
+                {
+                    using (var fs = new FileStream(queueXml, FileMode.Open))
+                    {
+                        var serializer = new XmlSerializer(typeof(List<ToDoItemWorkItem>));
+                        var list = (List<ToDoItemWorkItem>)serializer.Deserialize(fs);
+                        workQueue =
+                            new ConcurrentDictionary<ToDoItemWorkItem, int>();
+                        foreach (ToDoItemWorkItem item in list)
+                        {
+                            workQueue.TryAdd(item, 1);
+                        }
+                    }
+                    File.Delete(queueXml);
+                }
+            }
+        }
     }
+
 }
 
