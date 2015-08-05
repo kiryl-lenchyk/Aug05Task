@@ -23,13 +23,13 @@ namespace KirylLencykToDoManager
 
         private ConcurrentDictionary<ToDoItemWorkItem, int> workQueue;
 
-        private object synck;
+        private readonly object sync;
 
         public ToDoManager()
         {
             toDoManagerClient = new ToDoManagerServiceReference.ToDoManagerClient();
             workQueue = new ConcurrentDictionary<ToDoItemWorkItem, int>();
-            synck = new object();
+            sync = new object();
             LoadWorkQueue();
             InvokeWorkQueue();
         }
@@ -52,7 +52,7 @@ namespace KirylLencykToDoManager
             {
                 int indexToUpdate = localItems.IndexOf(toUpdate);
                 localItems[indexToUpdate] = todo;
-                Task.Run(() => UpdateItem(todo));
+                Task.Run(() => UpdateItemRemote(todo));
                 Task.Run(() => InvokeWorkQueue());
             }
         }
@@ -63,7 +63,7 @@ namespace KirylLencykToDoManager
 
             todo.ToDoId = localItems.Count;
             localItems.Add(todo);
-            Task.Run(() => AddItem(todo));
+            Task.Run(() => AddItemRemote(todo));
             Task.Run(() => InvokeWorkQueue());
         }
 
@@ -75,7 +75,7 @@ namespace KirylLencykToDoManager
             if (toDelete != null)
             {
                 localItems.Remove(toDelete);
-                Task.Run(() => DeleteItem(toDelete));
+                Task.Run(() => DeleteItemRemote(toDelete));
                 Task.Run(() => InvokeWorkQueue());
             }
         }
@@ -94,7 +94,7 @@ namespace KirylLencykToDoManager
             currentUserId = userId;
         }
 
-        private void AddItem(IToDoItem todo)
+        private void AddItemRemote(IToDoItem todo)
         {
             var currentWorkItem = new ToDoItemWorkItem {Item = todo.ToRemoteToDoItem(), WorkType = ToDoWorkType.Add};
             workQueue.TryAdd(currentWorkItem,1);
@@ -102,9 +102,7 @@ namespace KirylLencykToDoManager
             try
             {
                 toDoManagerClient.CreateToDoItem(todo.ToRemoteToDoItem());
-                int i;
-                workQueue.TryRemove(currentWorkItem, out i);
-                SaveWorkQueue();
+                DeleteFromWorkQueue(currentWorkItem);
             }
             catch (Exception)
             {
@@ -113,8 +111,7 @@ namespace KirylLencykToDoManager
         }
 
 
-
-        private void DeleteItem(IToDoItem todo)
+        private void DeleteItemRemote(IToDoItem todo)
         {
             var currentWorkItem = new ToDoItemWorkItem { Item = todo.ToRemoteToDoItem(), WorkType = ToDoWorkType.Add };
             workQueue.TryAdd(currentWorkItem, 1);
@@ -125,14 +122,38 @@ namespace KirylLencykToDoManager
                 if (realItemToDelete != null)
                     toDoManagerClient.DeleteToDoItem(realItemToDelete.ToDoId);
 
-                int i;
-                workQueue.TryRemove(currentWorkItem, out i);
-                SaveWorkQueue();
+                DeleteFromWorkQueue(currentWorkItem);
             }
             catch (Exception)
             {
                 ;
             }
+        }
+
+
+       private void UpdateItemRemote(IToDoItem todo)
+        {
+            var currentWorkItem = new ToDoItemWorkItem { Item = todo.ToRemoteToDoItem(), WorkType = ToDoWorkType.Add };
+            workQueue.TryAdd(currentWorkItem, 1);
+            SaveWorkQueue();
+            try
+            {
+                ToDoItem realItemToUpdate = GetRealItem(todo);
+                if (realItemToUpdate != null)
+                    toDoManagerClient.UpdateToDoItem(realItemToUpdate);
+                DeleteFromWorkQueue(currentWorkItem);
+            }
+            catch (Exception)
+            {
+                ;
+            }
+        }
+
+        private void DeleteFromWorkQueue(ToDoItemWorkItem currentWorkItem)
+        {
+            int i;
+            workQueue.TryRemove(currentWorkItem, out i);
+            SaveWorkQueue();
         }
 
         private ToDoItem GetRealItem(IToDoItem todo)
@@ -143,45 +164,25 @@ namespace KirylLencykToDoManager
             return realItem;
         }
 
-        private void UpdateItem(IToDoItem todo)
-        {
-            var currentWorkItem = new ToDoItemWorkItem { Item = todo.ToRemoteToDoItem(), WorkType = ToDoWorkType.Add };
-            workQueue.TryAdd(currentWorkItem, 1);
-            SaveWorkQueue();
-            try
-            {
-                ToDoItem realItemToUpdate = GetRealItem(todo);
-                if (realItemToUpdate != null)
-                    toDoManagerClient.UpdateToDoItem(realItemToUpdate);
-                int i;
-                workQueue.TryRemove(currentWorkItem, out i);
-                SaveWorkQueue();
-            }
-            catch (Exception)
-            {
-                ;
-            }
-        }
-
         private void InvokeToDoWorkItem(ToDoItemWorkItem item)
         {
             switch (item.WorkType)
             {
                 case ToDoWorkType.Add:
-                    AddItem(item.Item);
+                    AddItemRemote(item.Item);
                     break;
                 case ToDoWorkType.Remove:
-                    DeleteItem(item.Item);
+                    DeleteItemRemote(item.Item);
                     break;
                 case ToDoWorkType.Update:
-                    UpdateItem(item.Item);
+                    UpdateItemRemote(item.Item);
                     break;
             }
         }
 
         private void SaveWorkQueue()
         {
-            lock (synck)
+            lock (sync)
             {
 
                 if (workQueue.Count != 0)
@@ -205,7 +206,7 @@ namespace KirylLencykToDoManager
         private void InvokeWorkQueue()
         {
             ConcurrentDictionary<ToDoItemWorkItem, int> localQueueCopy;
-            lock (synck)
+            lock (sync)
             {
                 localQueueCopy = workQueue;
                 workQueue = new ConcurrentDictionary<ToDoItemWorkItem, int>();
@@ -222,7 +223,7 @@ namespace KirylLencykToDoManager
 
         private void LoadWorkQueue()
         {
-            lock (synck)
+            lock (sync)
             {
 
                 if (File.Exists(queueXml))
